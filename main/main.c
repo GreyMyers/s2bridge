@@ -15,8 +15,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
 #include "tinyusb.h"
 #include "class/hid/hid_device.h"
+
+#include "ble_central.h"
 
 static const char *TAG = "s2bridge";
 
@@ -132,6 +135,14 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "starting USB HID gamepad stub");
 
+    /* NimBLE stores its own state in NVS. */
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
     const tinyusb_config_t tusb_cfg = {
         .device_descriptor        = &device_descriptor,
         .string_descriptor        = string_descriptor,
@@ -142,6 +153,10 @@ void app_main(void)
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
     ESP_LOGI(TAG, "USB initialised, waiting for host");
+
+    /* Phase 2: BLE central runs alongside. The USB side keeps sending its
+     * synthetic circle - phase 3 replaces that with decoded controller data. */
+    ble_central_start();
 
     while (1) {
         if (tud_mounted() && tud_hid_ready()) {
