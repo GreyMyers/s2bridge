@@ -31,54 +31,11 @@ static const char *TAG = "s2bridge";
 
 /* --- Report ------------------------------------------------------------ */
 
-typedef struct __attribute__((packed)) {
-    int16_t  x, y, rx, ry;
-    uint8_t  hat;
-    uint16_t buttons;
-} gamepad_report_t;
 
-#define HAT_CENTERED 8
 
-/* Hand-written descriptor: 4x 16-bit axes, 8-way hat, 16 buttons.
- * TinyUSB's stock gamepad macro uses int8 axes, which throws away most of
- * the controller's 12-bit resolution. */
-#define S2_HID_REPORT_DESC() \
-    HID_USAGE_PAGE   ( HID_USAGE_PAGE_DESKTOP               ) ,\
-    HID_USAGE        ( HID_USAGE_DESKTOP_GAMEPAD            ) ,\
-    HID_COLLECTION   ( HID_COLLECTION_APPLICATION           ) ,\
-      HID_COLLECTION ( HID_COLLECTION_PHYSICAL              ) ,\
-        HID_USAGE_PAGE   ( HID_USAGE_PAGE_DESKTOP           ) ,\
-        HID_USAGE        ( HID_USAGE_DESKTOP_X              ) ,\
-        HID_USAGE        ( HID_USAGE_DESKTOP_Y              ) ,\
-        HID_USAGE        ( HID_USAGE_DESKTOP_RX             ) ,\
-        HID_USAGE        ( HID_USAGE_DESKTOP_RY             ) ,\
-        HID_LOGICAL_MIN_N( 0x8000, 2                        ) ,\
-        HID_LOGICAL_MAX_N( 0x7FFF, 2                        ) ,\
-        HID_REPORT_SIZE  ( 16                               ) ,\
-        HID_REPORT_COUNT ( 4                                ) ,\
-        HID_INPUT        ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE ) ,\
-        HID_USAGE        ( HID_USAGE_DESKTOP_HAT_SWITCH     ) ,\
-        HID_LOGICAL_MIN  ( 0                                ) ,\
-        HID_LOGICAL_MAX  ( 7                                ) ,\
-        HID_PHYSICAL_MIN ( 0                                ) ,\
-        HID_PHYSICAL_MAX_N ( 315, 2                         ) ,\
-        HID_UNIT         ( 0x14                             ) ,\
-        HID_REPORT_SIZE  ( 8                                ) ,\
-        HID_REPORT_COUNT ( 1                                ) ,\
-        HID_INPUT        ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE | HID_NULL_STATE ) ,\
-        HID_UNIT         ( 0                                ) ,\
-        HID_USAGE_PAGE   ( HID_USAGE_PAGE_BUTTON            ) ,\
-        HID_USAGE_MIN    ( 1                                ) ,\
-        HID_USAGE_MAX    ( 16                               ) ,\
-        HID_LOGICAL_MIN  ( 0                                ) ,\
-        HID_LOGICAL_MAX  ( 1                                ) ,\
-        HID_REPORT_SIZE  ( 1                                ) ,\
-        HID_REPORT_COUNT ( 16                               ) ,\
-        HID_INPUT        ( HID_DATA | HID_VARIABLE | HID_ABSOLUTE ) ,\
-      HID_COLLECTION_END ,\
-    HID_COLLECTION_END
-
-static const uint8_t hid_report_descriptor[] = { S2_HID_REPORT_DESC() };
+static const uint8_t hid_report_descriptor[] = {
+    TUD_HID_REPORT_DESC_GAMEPAD()
+};
 
 static const tusb_desc_device_t device_descriptor = {
     .bLength            = sizeof(tusb_desc_device_t),
@@ -152,20 +109,20 @@ static uint8_t dpad_to_hat(uint32_t b)
     bool left  = b & S2_BTN_LEFT;
     bool right = b & S2_BTN_RIGHT;
 
-    if (up    && right) return 1;
-    if (right && down)  return 3;
-    if (down  && left)  return 5;
-    if (left  && up)    return 7;
-    if (up)             return 0;
-    if (right)          return 2;
-    if (down)           return 4;
-    if (left)           return 6;
-    return HAT_CENTERED;
+    if (up    && right) return GAMEPAD_HAT_UP_RIGHT;
+    if (right && down)  return GAMEPAD_HAT_DOWN_RIGHT;
+    if (down  && left)  return GAMEPAD_HAT_DOWN_LEFT;
+    if (left  && up)    return GAMEPAD_HAT_UP_LEFT;
+    if (up)             return GAMEPAD_HAT_UP;
+    if (right)          return GAMEPAD_HAT_RIGHT;
+    if (down)           return GAMEPAD_HAT_DOWN;
+    if (left)           return GAMEPAD_HAT_LEFT;
+    return GAMEPAD_HAT_CENTERED;
 }
 
-static uint16_t map_buttons(uint32_t b)
+static uint32_t map_buttons(uint32_t b)
 {
-    uint16_t out = 0;
+    uint32_t out = 0;
 
 #if MAP_BY_POSITION
     /* South/east/west/north -> buttons 1-4, matching Xbox physical layout */
@@ -196,6 +153,15 @@ static uint16_t map_buttons(uint32_t b)
     return out;
 }
 
+/* int16 -> int8, clamped so -32768 does not wrap to +128. */
+static int8_t to_i8(int16_t v)
+{
+    int32_t t = v >> 8;
+    if (t >  127) t =  127;
+    if (t < -127) t = -127;
+    return (int8_t)t;
+}
+
 /* --- Main -------------------------------------------------------------- */
 
 void app_main(void)
@@ -221,31 +187,33 @@ void app_main(void)
 
     ble_central_start();
 
-    gamepad_report_t report;
-    gamepad_report_t last = {0};
+    hid_gamepad_report_t report;
+    hid_gamepad_report_t last = {0};
     bool have_last = false;
+    int  idle_ticks = 0;
 
     while (1) {
         s2_state_t st;
         ble_central_get_state(&st);
 
         memset(&report, 0, sizeof(report));
-        report.hat = HAT_CENTERED;
+        report.hat = GAMEPAD_HAT_CENTERED;
 
         if (st.connected) {
-            report.x       = st.lx;
-            report.y       = st.ly;
-            report.rx      = st.rx;
-            report.ry      = st.ry;
+            report.x       = to_i8(st.lx);
+            report.y       = to_i8(st.ly);
+            report.z       = to_i8(st.rx);
+            report.rz      = to_i8(st.ry);
             report.hat     = dpad_to_hat(st.buttons_raw);
             report.buttons = map_buttons(st.buttons_raw);
         }
 
-        /* Send on change, plus a keepalive so the host never times out. */
-        static int idle_ticks = 0;
         bool changed = !have_last || memcmp(&report, &last, sizeof(report)) != 0;
 
-        if (tud_mounted() && tud_hid_ready() && (changed || ++idle_ticks >= 50)) {
+        if (changed) { idle_ticks = 0; } else { idle_ticks++; }
+
+        /* Send on change, plus a keepalive about every 100ms. */
+        if (tud_mounted() && tud_hid_ready() && (changed || idle_ticks >= 25)) {
             tud_hid_report(0, &report, sizeof(report));
             last = report;
             have_last = true;
