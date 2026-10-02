@@ -1,12 +1,11 @@
 /*
- * Phase 2: NimBLE central for the Switch 2 Pro Controller.
+ * Phase 3: NimBLE central for the Switch 2 Pro Controller.
  *
- * Scans for the controller's advertisement, connects, discovers the three
- * vendor characteristics, runs the init handshake, bonds, subscribes to input
- * notifications, and hex-dumps every report to the UART console.
+ * Scans, connects, reads factory stick calibration, runs the init handshake,
+ * bonds, subscribes to input notifications, and decodes each report into a
+ * shared state struct that the USB HID side reads.
  *
  * Protocol constants transcribed from trevlars/switch2-controllers-linux.
- * No decoding here - phase 3 does that.
  */
 
 #include <string.h>
@@ -25,9 +24,11 @@
 
 static const char *TAG = "s2ble";
 
-/* Set to 0 to connect without writing the LTK. The controller stays bonded to
- * your Switch 2, but you must hold Sync before every run. */
+/* Set to 0 to connect without writing the LTK. */
 #define ENABLE_BONDING 1
+
+/* Log one decoded line per second so you can watch values without flooding. */
+#define LOG_DECODED 1
 
 /* ------------------------------------------------------------------ *
  * Protocol constants                                                   *
@@ -37,27 +38,32 @@ static const char *TAG = "s2ble";
 #define NINTENDO_VID        0x057E
 #define PRO_CONTROLLER2_PID 0x2069
 
-#define CMD_HOST      0x01
-#define CMD_MEMORY    0x02
-#define CMD_LEDS      0x09
-#define CMD_VIBRATION 0x0A
-#define CMD_FEATURE   0x0C
-#define CMD_PAIR      0x15
+#define CMD_MEMORY  0x02
+#define CMD_LEDS    0x09
+#define CMD_FEATURE 0x0C
+#define CMD_PAIR    0x15
 
-#define SUB_LEDS_SET_PLAYER  0x07
-#define SUB_FEATURE_INIT     0x02
-#define SUB_FEATURE_ENABLE   0x04
-#define SUB_PAIR_SET_MAC     0x01
-#define SUB_PAIR_LTK1        0x04
-#define SUB_PAIR_LTK2        0x02
-#define SUB_PAIR_FINISH      0x03
+#define SUB_MEMORY_READ     0x04
+#define SUB_LEDS_SET_PLAYER 0x07
+#define SUB_FEATURE_INIT    0x02
+#define SUB_FEATURE_ENABLE  0x04
+#define SUB_PAIR_SET_MAC    0x01
+#define SUB_PAIR_LTK1       0x04
+#define SUB_PAIR_LTK2       0x02
+#define SUB_PAIR_FINISH     0x03
 
 #define FEATURE_MOTION 0x04
-#define FEATURE_FLAGS  (0x03 | FEATURE_MOTION)   /* 0x07 */
+#define FEATURE_FLAGS  (0x03 | FEATURE_MOTION)
 
 #define LED_PLAYER_1 0x01
 
-/* Fixed LTK halves the protocol expects. Same for every controller and host. */
+/* Factory stick calibration. User slots (0x001FC042 / 0x001FC062) hold a
+ * Switch-side recalibration when present; factory is always valid, so we
+ * read that and keep the code simple. */
+#define CAL_ADDR_LEFT  0x000130A8
+#define CAL_ADDR_RIGHT 0x000130E8
+#define CAL_READ_LEN   0x0B
+
 static const uint8_t PAIR_LTK1[17] = {
     0x00, 0xEA, 0xBD, 0x47, 0x13, 0x89, 0x35, 0x42, 0xC6,
     0x79, 0xEE, 0x07, 0xF2, 0x53, 0x2C, 0x6C, 0x31,
@@ -66,8 +72,6 @@ static const uint8_t PAIR_LTK2[17] = {
     0x00, 0x40, 0xB0, 0x8A, 0x5F, 0xCD, 0x1F, 0x9B, 0x41,
     0x12, 0x5C, 0xAC, 0xC6, 0x3F, 0x38, 0xA0, 0x73,
 };
-
-/* 128-bit vendor UUIDs, byte-reversed for NimBLE (little-endian). */
 
 /* ab7de9be-89fe-49ad-828f-118f09df7fd2 - input reports (notify) */
 static const ble_uuid128_t UUID_INPUT = BLE_UUID128_INIT(
@@ -85,12 +89,99 @@ static const ble_uuid128_t UUID_CMD_RESP = BLE_UUID128_INIT(
     0x36, 0x4d, 0xd8, 0xd9, 0x61, 0xa9, 0x65, 0xc7);
 
 /* ------------------------------------------------------------------ *
+ * Shared state                                                         *
+ * ------------------------------------------------------------------ */
+
+static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static s2_state_t   s_state;
+
+bool ble_central_get_state(s2_state_t *out)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    *out = s_state;
+    portEXIT_CRITICAL(&s_state_lock);
+    return out->connected;
+}
+
+/* ------------------------------------------------------------------ *
+ * Stick calibration                                                    *
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    uint16_t cx, cy;      /* center */
+    uint16_t maxx, maxy;  /* positive offsets from center */
+    uint16_t minx, miny;  /* negative offsets from center */
+    bool     valid;
+} stick_cal_t;
+
+static stick_cal_t s_cal_left, s_cal_right;
+
+/* Three bytes hold two 12-bit axes. */
+static inline void unpack_stick(const uint8_t *b, uint16_t *x, uint16_t *y)
+{
+    *x = (uint16_t)(b[0] | ((b[1] & 0x0F) << 8));
+    *y = (uint16_t)((b[1] >> 4) | (b[2] << 4));
+}
+
+static void load_cal(stick_cal_t *c, const uint8_t *d)
+{
+    unpack_stick(&d[0], &c->cx,   &c->cy);
+    unpack_stick(&d[3], &c->maxx, &c->maxy);
+    unpack_stick(&d[6], &c->minx, &c->miny);
+
+    /* Reject blank or nonsensical calibration and fall back to a sane
+     * 12-bit default rather than producing dead sticks. */
+    if (c->cx == 0 || c->cx == 0xFFF || c->maxx == 0 || c->minx == 0 ||
+        c->maxy == 0 || c->miny == 0) {
+        ESP_LOGW(TAG, "calibration looks invalid; using defaults");
+        c->cx = c->cy = 0x800;
+        c->maxx = c->maxy = c->minx = c->miny = 0x600;
+    }
+    c->valid = true;
+
+    ESP_LOGI(TAG, "cal center=(%u,%u) max=(%u,%u) min=(%u,%u)",
+             c->cx, c->cy, c->maxx, c->maxy, c->minx, c->miny);
+}
+
+static void default_cal(stick_cal_t *c)
+{
+    c->cx = c->cy = 0x800;
+    c->maxx = c->maxy = c->minx = c->miny = 0x600;
+    c->valid = false;
+}
+
+/* Scale a raw 12-bit axis into full int16 range using asymmetric
+ * per-direction calibration, then apply a deadzone. */
+static int16_t scale_axis(uint16_t raw, uint16_t center,
+                          uint16_t max_off, uint16_t min_off, bool invert)
+{
+    int32_t d = (int32_t)raw - (int32_t)center;
+    int32_t out;
+
+    if (d >= 0) {
+        out = max_off ? (d * 32767) / max_off : 0;
+    } else {
+        out = min_off ? (d * 32767) / min_off : 0;
+    }
+
+    if (out >  32767) out =  32767;
+    if (out < -32767) out = -32767;
+
+    if (out > -S2_DEADZONE && out < S2_DEADZONE) {
+        out = 0;
+    }
+    return (int16_t)(invert ? -out : out);
+}
+
+/* ------------------------------------------------------------------ *
  * Connection state                                                     *
  * ------------------------------------------------------------------ */
 
 typedef enum {
     STEP_IDLE = 0,
     STEP_SUB_CMD_RESP,
+    STEP_READ_CAL_L,
+    STEP_READ_CAL_R,
     STEP_LEDS,
     STEP_FEAT_INIT,
     STEP_FEAT_ENABLE,
@@ -103,9 +194,9 @@ typedef enum {
 } init_step_t;
 
 static const char *step_name[] = {
-    "idle", "sub-cmd-resp", "leds", "feature-init", "feature-enable",
-    "sub-input", "bond-mac", "bond-ltk1", "bond-ltk2", "bond-finish",
-    "running",
+    "idle", "sub-cmd-resp", "read-cal-L", "read-cal-R", "leds",
+    "feature-init", "feature-enable", "sub-input", "bond-mac",
+    "bond-ltk1", "bond-ltk2", "bond-finish", "running",
 };
 
 static struct {
@@ -120,14 +211,13 @@ static struct {
     uint16_t h_cmd_resp_cccd;
 
     init_step_t step;
-    uint8_t     pending_cmd;      /* command id we expect a response for */
+    uint8_t     pending_cmd;
 
     uint32_t report_count;
 } s_ctx;
 
 #define INVALID_HANDLE 0
 
-/* CCCD handles collected during descriptor discovery. */
 #define MAX_CCCDS 16
 static uint16_t s_cccds[MAX_CCCDS];
 static int      s_cccd_count;
@@ -138,11 +228,6 @@ static void advance(void);
  * Command framing                                                      *
  * ------------------------------------------------------------------ */
 
-/*
- * Frame layout (the shared 0x91 protocol):
- *   [0] command   [1] 0x91   [2] 0x01   [3] subcommand
- *   [4] 0x00      [5] len    [6] 0x00   [7] 0x00   [8..] payload
- */
 static int send_command(uint8_t cmd, uint8_t sub, const uint8_t *data, uint8_t len)
 {
     uint8_t buf[8 + 64];
@@ -174,7 +259,23 @@ static int send_command(uint8_t cmd, uint8_t sub, const uint8_t *data, uint8_t l
     return rc;
 }
 
-/* CCCD write completion just moves the state machine forward. */
+/* read_memory: payload is length, 7e 00 00, then a 4-byte LE address. */
+static int send_read_memory(uint8_t len, uint32_t addr)
+{
+    uint8_t p[8];
+
+    p[0] = len;
+    p[1] = 0x7e;
+    p[2] = 0x00;
+    p[3] = 0x00;
+    p[4] = (uint8_t)(addr      );
+    p[5] = (uint8_t)(addr >>  8);
+    p[6] = (uint8_t)(addr >> 16);
+    p[7] = (uint8_t)(addr >> 24);
+
+    return send_command(CMD_MEMORY, SUB_MEMORY_READ, p, sizeof(p));
+}
+
 static int on_cccd_written(uint16_t conn_handle, const struct ble_gatt_error *error,
                            struct ble_gatt_attr *attr, void *arg)
 {
@@ -211,15 +312,20 @@ static void advance(void)
 
     switch (s_ctx.step) {
     case STEP_SUB_CMD_RESP:
-        /* Must come first: write_command correlates replies on this
-         * characteristic, so nothing else works until it is live. */
         subscribe(s_ctx.h_cmd_resp_cccd);
+        break;
+
+    case STEP_READ_CAL_L:
+        send_read_memory(CAL_READ_LEN, CAL_ADDR_LEFT);
+        break;
+
+    case STEP_READ_CAL_R:
+        send_read_memory(CAL_READ_LEN, CAL_ADDR_RIGHT);
         break;
 
     case STEP_LEDS:
         payload[0] = LED_PLAYER_1;
         memset(&payload[1], 0, 3);
-        ESP_LOGI(TAG, "setting player LEDs");
         send_command(CMD_LEDS, SUB_LEDS_SET_PLAYER, payload, 4);
         break;
 
@@ -241,12 +347,10 @@ static void advance(void)
 
 #if ENABLE_BONDING
     case STEP_BOND_MAC:
-        /* 0x00 0x02 then our MAC twice, little-endian. */
         payload[0] = 0x00;
         payload[1] = 0x02;
         memcpy(&payload[2], s_ctx.own_addr, 6);
         memcpy(&payload[8], s_ctx.own_addr, 6);
-        ESP_LOGI(TAG, "bonding to this host");
         send_command(CMD_PAIR, SUB_PAIR_SET_MAC, payload, 14);
         break;
 
@@ -274,12 +378,65 @@ static void advance(void)
 #endif
 
     case STEP_RUNNING:
-        ESP_LOGI(TAG, "handshake complete - streaming input reports");
+        ESP_LOGI(TAG, "handshake complete - decoding input reports");
+        portENTER_CRITICAL(&s_state_lock);
+        s_state.connected = true;
+        portEXIT_CRITICAL(&s_state_lock);
         break;
 
     default:
         break;
     }
+}
+
+/* ------------------------------------------------------------------ *
+ * Report decoding                                                      *
+ * ------------------------------------------------------------------ */
+
+/*
+ * 63-byte input report layout:
+ *   [0..3]   timestamp, 32-bit LE
+ *   [4..7]   button bitfield, 32-bit LE
+ *   [10..12] left stick,  two 12-bit axes
+ *   [13..15] right stick, two 12-bit axes
+ *   [31]     battery
+ *   [48..59] motion, 6 x int16
+ */
+static void decode_report(const uint8_t *r, uint16_t len)
+{
+    if (len < 32) {
+        return;
+    }
+
+    uint32_t btn = (uint32_t)r[4]
+                 | ((uint32_t)r[5] << 8)
+                 | ((uint32_t)r[6] << 16)
+                 | ((uint32_t)r[7] << 24);
+
+    uint16_t lx_raw, ly_raw, rx_raw, ry_raw;
+    unpack_stick(&r[10], &lx_raw, &ly_raw);
+    unpack_stick(&r[13], &rx_raw, &ry_raw);
+
+    s2_state_t st;
+    st.connected = true;
+    st.buttons_raw = btn;
+    st.battery = r[31];
+
+    st.lx = scale_axis(lx_raw, s_cal_left.cx,  s_cal_left.maxx,  s_cal_left.minx,  S2_INVERT_LX);
+    st.ly = scale_axis(ly_raw, s_cal_left.cy,  s_cal_left.maxy,  s_cal_left.miny,  S2_INVERT_LY);
+    st.rx = scale_axis(rx_raw, s_cal_right.cx, s_cal_right.maxx, s_cal_right.minx, S2_INVERT_RX);
+    st.ry = scale_axis(ry_raw, s_cal_right.cy, s_cal_right.maxy, s_cal_right.miny, S2_INVERT_RY);
+
+    portENTER_CRITICAL(&s_state_lock);
+    s_state = st;
+    portEXIT_CRITICAL(&s_state_lock);
+
+#if LOG_DECODED
+    if (s_ctx.report_count % 120 == 1) {
+        ESP_LOGI(TAG, "btn=%08lx L=(%6d,%6d) R=(%6d,%6d) batt=%u",
+                 (unsigned long)btn, st.lx, st.ly, st.rx, st.ry, st.battery);
+    }
+#endif
 }
 
 /* ------------------------------------------------------------------ *
@@ -290,8 +447,6 @@ static int on_dsc(uint16_t conn_handle, const struct ble_gatt_error *error,
                   uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
 {
     if (error->status == BLE_HS_EDONE) {
-        /* Pair each characteristic with the first CCCD above its value
-         * handle. Avoids assuming val_handle+1. */
         for (int i = 0; i < s_cccd_count; i++) {
             uint16_t h = s_cccds[i];
             if (h > s_ctx.h_input &&
@@ -311,7 +466,7 @@ static int on_dsc(uint16_t conn_handle, const struct ble_gatt_error *error,
 
         if (s_ctx.h_input == INVALID_HANDLE || s_ctx.h_cmd_write == INVALID_HANDLE ||
             s_ctx.h_cmd_resp == INVALID_HANDLE) {
-            ESP_LOGE(TAG, "missing characteristic - check UUID byte order");
+            ESP_LOGE(TAG, "missing characteristic");
             ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             return 0;
         }
@@ -337,7 +492,6 @@ static int on_chr(uint16_t conn_handle, const struct ble_gatt_error *error,
                   const struct ble_gatt_chr *chr, void *arg)
 {
     if (error->status == BLE_HS_EDONE) {
-        /* Characteristics done; now sweep descriptors for CCCDs. */
         s_cccd_count = 0;
         int rc = ble_gattc_disc_all_dscs(conn_handle, 1, 0xffff, on_dsc, NULL);
         if (rc != 0) {
@@ -366,9 +520,6 @@ static int on_mtu(uint16_t conn_handle, const struct ble_gatt_error *error,
 {
     if (error->status == 0) {
         ESP_LOGI(TAG, "MTU negotiated: %u", mtu);
-        if (mtu < 70) {
-            ESP_LOGW(TAG, "MTU too small for 63-byte reports - will truncate");
-        }
     } else {
         ESP_LOGW(TAG, "MTU exchange failed: %d (continuing)", error->status);
     }
@@ -391,7 +542,6 @@ static bool is_target(const struct ble_hs_adv_fields *fields)
     if (m == NULL || fields->mfg_data_len < 9) {
         return false;
     }
-    /* [0..1] company, [2..4] fixed, [5..6] VID, [7..8] PID - all LE */
     if ((m[0] | (m[1] << 8)) != NINTENDO_COMPANY_ID) {
         return false;
     }
@@ -404,12 +554,8 @@ static bool is_target(const struct ble_hs_adv_fields *fields)
 static void start_scan(void)
 {
     struct ble_gap_disc_params p = {
-        .itvl              = 0,
-        .window            = 0,
-        .filter_policy     = 0,
-        .limited           = 0,
-        .passive           = 0,
-        .filter_duplicates = 1,
+        .itvl = 0, .window = 0, .filter_policy = 0,
+        .limited = 0, .passive = 0, .filter_duplicates = 1,
     };
 
     int rc = ble_gap_disc(s_ctx.own_addr_type, BLE_HS_FOREVER, &p,
@@ -436,25 +582,14 @@ int ble_central_gap_event(struct ble_gap_event *event, void *arg)
             return 0;
         }
 
-        ESP_LOGI(TAG, "found controller %02x:%02x:%02x:%02x:%02x:%02x rssi=%d",
-                 event->disc.addr.val[5], event->disc.addr.val[4],
-                 event->disc.addr.val[3], event->disc.addr.val[2],
-                 event->disc.addr.val[1], event->disc.addr.val[0],
-                 event->disc.rssi);
-
+        ESP_LOGI(TAG, "found controller, rssi=%d", event->disc.rssi);
         ble_gap_disc_cancel();
 
-        /* 7.5ms connection interval - the BLE floor, matching what the
-         * Windows bridge reaches at 133Hz. Units are 1.25ms. */
         struct ble_gap_conn_params cp = {
-            .scan_itvl           = 0x0010,
-            .scan_window         = 0x0010,
-            .itvl_min            = 6,
-            .itvl_max            = 12,
-            .latency             = 0,
-            .supervision_timeout = 400,
-            .min_ce_len          = 0,
-            .max_ce_len          = 0,
+            .scan_itvl = 0x0010, .scan_window = 0x0010,
+            .itvl_min = 6, .itvl_max = 12,
+            .latency = 0, .supervision_timeout = 400,
+            .min_ce_len = 0, .max_ce_len = 0,
         };
 
         rc = ble_gap_connect(s_ctx.own_addr_type, &event->disc.addr, 10000,
@@ -477,10 +612,11 @@ int ble_central_gap_event(struct ble_gap_event *event, void *arg)
         s_ctx.step = STEP_IDLE;
         s_ctx.report_count = 0;
 
+        default_cal(&s_cal_left);
+        default_cal(&s_cal_right);
+
         ESP_LOGI(TAG, "connected, handle=%d", s_ctx.conn_handle);
 
-        /* Default ATT MTU is 23, which caps notifications at 20 bytes.
-         * The input report is 63, so this exchange is mandatory. */
         rc = ble_gattc_exchange_mtu(s_ctx.conn_handle, on_mtu, NULL);
         if (rc != 0) {
             ESP_LOGE(TAG, "MTU exchange failed to start: %d", rc);
@@ -489,9 +625,15 @@ int ble_central_gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGW(TAG, "disconnected (reason 0x%02x) after %lu reports",
-                 event->disconnect.reason, s_ctx.report_count);
+                 event->disconnect.reason, (unsigned long)s_ctx.report_count);
         s_ctx.conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_ctx.step = STEP_IDLE;
+
+        /* Release every input so nothing sticks on the host. */
+        portENTER_CRITICAL(&s_state_lock);
+        memset(&s_state, 0, sizeof(s_state));
+        portEXIT_CRITICAL(&s_state_lock);
+
         start_scan();
         return 0;
 
@@ -505,31 +647,32 @@ int ble_central_gap_event(struct ble_gap_event *event, void *arg)
         ble_hs_mbuf_to_flat(event->notify_rx.om, buf, len, NULL);
 
         if (event->notify_rx.attr_handle == s_ctx.h_cmd_resp) {
-            /* Response header mirrors the command frame: [0] echoes the
-             * command id, [1] is status (0x01 = OK), payload from [8]. */
             if (len < 8 || buf[0] != s_ctx.pending_cmd || buf[1] != 0x01) {
                 ESP_LOGE(TAG, "bad response at step %s:", step_name[s_ctx.step]);
                 ESP_LOG_BUFFER_HEX(TAG, buf, len < 16 ? len : 16);
                 return 0;
             }
-            ESP_LOGI(TAG, "step %s ok", step_name[s_ctx.step]);
+
+            /* Memory reads carry their payload after the 8-byte command
+             * header plus the 8-byte read header: length, 7e 00 00, addr. */
+            if (s_ctx.step == STEP_READ_CAL_L && len >= 16 + 9) {
+                load_cal(&s_cal_left, &buf[16]);
+            } else if (s_ctx.step == STEP_READ_CAL_R && len >= 16 + 9) {
+                load_cal(&s_cal_right, &buf[16]);
+            } else {
+                ESP_LOGI(TAG, "step %s ok", step_name[s_ctx.step]);
+            }
+
             s_ctx.step++;
             advance();
         } else if (event->notify_rx.attr_handle == s_ctx.h_input) {
             s_ctx.report_count++;
-            /* Every 60th report keeps the console readable while still
-               showing live data. Drop the modulo to see everything. */
-            if (s_ctx.report_count % 60 == 1) {
-                ESP_LOGI(TAG, "input report #%lu (%u bytes):",
-                         s_ctx.report_count, len);
-                ESP_LOG_BUFFER_HEX(TAG, buf, len);
-            }
+            decode_report(buf, len);
         }
         return 0;
     }
 
     case BLE_GAP_EVENT_MTU:
-        ESP_LOGI(TAG, "MTU updated to %d", event->mtu.value);
         return 0;
 
     default:
@@ -559,11 +702,6 @@ static void on_sync(void)
         return;
     }
     ble_hs_id_copy_addr(s_ctx.own_addr_type, s_ctx.own_addr, NULL);
-
-    ESP_LOGI(TAG, "host addr %02x:%02x:%02x:%02x:%02x:%02x",
-             s_ctx.own_addr[5], s_ctx.own_addr[4], s_ctx.own_addr[3],
-             s_ctx.own_addr[2], s_ctx.own_addr[1], s_ctx.own_addr[0]);
-
     start_scan();
 }
 
@@ -576,15 +714,14 @@ static void host_task(void *param)
 void ble_central_start(void)
 {
     s_ctx.conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    memset(&s_state, 0, sizeof(s_state));
+    default_cal(&s_cal_left);
+    default_cal(&s_cal_right);
 
     ESP_ERROR_CHECK(nimble_port_init());
 
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb  = on_sync;
-
-    /* No SMP. The controller's "bond" is application-layer: we write our MAC
-     * and a fixed LTK over ATT. The link itself stays unencrypted, matching
-     * BT_SECURITY_LOW on the Linux bridge. */
     ble_hs_cfg.sm_bonding = 0;
     ble_hs_cfg.sm_mitm    = 0;
     ble_hs_cfg.sm_sc      = 0;
