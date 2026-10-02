@@ -120,35 +120,62 @@ static uint8_t dpad_to_hat(uint32_t b)
     return GAMEPAD_HAT_CENTERED;
 }
 
+/*
+ * Button indices follow the Linux evdev gamepad ordering, which is what
+ * the TV uses. Note it is NOT the Xbox ordering: evdev inserts BTN_C at
+ * index 2 and BTN_Z at index 5, so the face buttons sit at 0,1,3,4 and
+ * the bumpers at 6,7.
+ *
+ *   0 BTN_SOUTH    5 BTN_Z        10 BTN_SELECT
+ *   1 BTN_EAST     6 BTN_TL       11 BTN_START
+ *   2 BTN_C        7 BTN_TR       12 BTN_MODE
+ *   3 BTN_NORTH    8 BTN_TL2      13 BTN_THUMBL  (L3)
+ *   4 BTN_WEST     9 BTN_TR2      14 BTN_THUMBR  (R3)
+ */
+#define BTN_IDX_SOUTH   0
+#define BTN_IDX_EAST    1
+#define BTN_IDX_C       2
+#define BTN_IDX_NORTH   3
+#define BTN_IDX_WEST    4
+#define BTN_IDX_Z       5
+#define BTN_IDX_TL      6
+#define BTN_IDX_TR      7
+#define BTN_IDX_TL2     8
+#define BTN_IDX_TR2     9
+#define BTN_IDX_SELECT 10
+#define BTN_IDX_START  11
+#define BTN_IDX_MODE   12
+#define BTN_IDX_THUMBL 13
+#define BTN_IDX_THUMBR 14
+
 static uint32_t map_buttons(uint32_t b)
 {
     uint32_t out = 0;
 
 #if MAP_BY_POSITION
-    /* South/east/west/north -> buttons 1-4, matching Xbox physical layout */
-    if (b & S2_BTN_B) out |= 1u << 0;   /* south */
-    if (b & S2_BTN_A) out |= 1u << 1;   /* east  */
-    if (b & S2_BTN_Y) out |= 1u << 2;   /* west  */
-    if (b & S2_BTN_X) out |= 1u << 3;   /* north */
+    /* Switch B is south, A is east, Y is west, X is north. */
+    if (b & S2_BTN_B) out |= 1u << BTN_IDX_SOUTH;
+    if (b & S2_BTN_A) out |= 1u << BTN_IDX_EAST;
+    if (b & S2_BTN_Y) out |= 1u << BTN_IDX_WEST;
+    if (b & S2_BTN_X) out |= 1u << BTN_IDX_NORTH;
 #else
-    if (b & S2_BTN_A) out |= 1u << 0;
-    if (b & S2_BTN_B) out |= 1u << 1;
-    if (b & S2_BTN_X) out |= 1u << 2;
-    if (b & S2_BTN_Y) out |= 1u << 3;
+    if (b & S2_BTN_A) out |= 1u << BTN_IDX_SOUTH;
+    if (b & S2_BTN_B) out |= 1u << BTN_IDX_EAST;
+    if (b & S2_BTN_X) out |= 1u << BTN_IDX_WEST;
+    if (b & S2_BTN_Y) out |= 1u << BTN_IDX_NORTH;
 #endif
 
-    if (b & S2_BTN_L)       out |= 1u << 4;
-    if (b & S2_BTN_R)       out |= 1u << 5;
-    if (b & S2_BTN_ZL)      out |= 1u << 6;
-    if (b & S2_BTN_ZR)      out |= 1u << 7;
-    if (b & S2_BTN_MINUS)   out |= 1u << 8;
-    if (b & S2_BTN_PLUS)    out |= 1u << 9;
-    if (b & S2_BTN_L_STK)   out |= 1u << 10;
-    if (b & S2_BTN_R_STK)   out |= 1u << 11;
-    if (b & S2_BTN_HOME)    out |= 1u << 12;
-    if (b & S2_BTN_CAPTURE) out |= 1u << 13;
-    if (b & S2_BTN_GL)      out |= 1u << 14;
-    if (b & S2_BTN_GR)      out |= 1u << 15;
+    if (b & S2_BTN_L)       out |= 1u << BTN_IDX_TL;
+    if (b & S2_BTN_R)       out |= 1u << BTN_IDX_TR;
+    if (b & S2_BTN_ZL)      out |= 1u << BTN_IDX_TL2;
+    if (b & S2_BTN_ZR)      out |= 1u << BTN_IDX_TR2;
+    if (b & S2_BTN_MINUS)   out |= 1u << BTN_IDX_SELECT;
+    if (b & S2_BTN_PLUS)    out |= 1u << BTN_IDX_START;
+    if (b & S2_BTN_HOME)    out |= 1u << BTN_IDX_MODE;
+    if (b & S2_BTN_L_STK)   out |= 1u << BTN_IDX_THUMBL;
+    if (b & S2_BTN_R_STK)   out |= 1u << BTN_IDX_THUMBR;
+    if (b & S2_BTN_CAPTURE) out |= 1u << BTN_IDX_C;
+    if (b & S2_BTN_C)       out |= 1u << BTN_IDX_Z;
 
     return out;
 }
@@ -198,12 +225,19 @@ void app_main(void)
 
         memset(&report, 0, sizeof(report));
         report.hat = GAMEPAD_HAT_CENTERED;
+        report.z   = -127;
+        report.rz  = -127;
 
         if (st.connected) {
             report.x       = to_i8(st.lx);
             report.y       = to_i8(st.ly);
-            report.z       = to_i8(st.rx);
-            report.rz      = to_i8(st.ry);
+            report.rx      = to_i8(st.rx);
+            report.ry      = to_i8(st.ry);
+            /* Analog trigger axes. ZL/ZR are digital on this pad, so these
+             * are full-off or full-on. Hosts expect the right stick on
+             * rx/ry and the triggers on z/rz. */
+            report.z       = (st.buttons_raw & S2_BTN_ZL) ? 127 : -127;
+            report.rz      = (st.buttons_raw & S2_BTN_ZR) ? 127 : -127;
             report.hat     = dpad_to_hat(st.buttons_raw);
             report.buttons = map_buttons(st.buttons_raw);
         }
